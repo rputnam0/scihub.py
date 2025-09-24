@@ -29,6 +29,7 @@ urllib3.disable_warnings()
 # constants
 SCHOLARS_BASE_URL = 'https://scholar.google.com/scholar'
 HEADERS = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:27.0) Gecko/20100101 Firefox/27.0'}
+DOI_PATTERN = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.IGNORECASE)
 
 class SciHub(object):
     """
@@ -180,6 +181,62 @@ class SciHub(object):
                        % (identifier, url)
             }
 
+    def resolve_identifier_to_doi(self, identifier):
+        """
+        Try to resolve *identifier* to a DOI string.
+
+        The identifier can be a DOI, PMID, paywalled URL, or other link returned
+        from a Google Scholar search. If the identifier already looks like a DOI,
+        it is returned as-is. Otherwise, Sci-Hub is queried similarly to the
+        ``--search_download`` CLI flow and the returned HTML is scanned for a DOI.
+        """
+
+        doi = self._extract_doi(identifier)
+        if doi:
+            return doi
+
+        try:
+            response = self.sess.get(self.base_url + identifier, verify=False)
+        except requests.exceptions.RequestException:
+            return None
+
+        doi = self._extract_doi(response.url)
+        if doi:
+            return doi
+
+        soup = self._get_soup(response.content)
+
+        # Check obvious attributes first.
+        for tag in soup.find_all(True):
+            for attr in ("href", "src"):
+                value = tag.attrs.get(attr)
+                if not value:
+                    continue
+                doi = self._extract_doi(value)
+                if doi:
+                    return doi
+
+        text = soup.get_text(" ", strip=True)
+        return self._extract_doi(text)
+
+    def search_for_doi(self, query, limit=10):
+        """Search Google Scholar for *query* and attempt to resolve a DOI."""
+
+        results = self.search(query, limit)
+        if 'err' in results:
+            message = results['err']
+            if isinstance(message, str) and 'captcha' in message.lower():
+                raise CaptchaNeedException(message)
+            logger.info('Search failed for %s: %s', query, message)
+            return None, None
+        papers = results.get('papers', [])
+        for paper in papers:
+            identifier = paper.get('url', '')
+            doi = self.resolve_identifier_to_doi(identifier)
+            if doi:
+                return doi, paper
+        return None, None
+
     def _get_direct_url(self, identifier):
         """
         Finds the direct source url for a given identifier.
@@ -234,7 +291,7 @@ class SciHub(object):
 
     def _generate_name(self, res):
         """
-        Generate unique filename for paper. Returns a name by calcuating 
+        Generate unique filename for paper. Returns a name by calcuating
         md5 hash of file contents, then appending the last 20 characters
         of the url which typically provides a good paper identifier.
         """
@@ -242,6 +299,17 @@ class SciHub(object):
         name = re.sub('#view=(.+)', '', name)
         pdf_hash = hashlib.md5(res.content).hexdigest()
         return '%s-%s' % (pdf_hash, name[-20:])
+
+    def _extract_doi(self, text):
+        """Return the first DOI detected in *text*, or ``None``."""
+
+        if not text:
+            return None
+
+        match = DOI_PATTERN.search(text)
+        if match:
+            return match.group(0).rstrip(').,;')
+        return None
 
 class CaptchaNeedException(Exception):
     pass
