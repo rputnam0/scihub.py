@@ -31,6 +31,7 @@ class DownloadResult:
     ratio: float | None
     file_path: str | None
     error: str | None = None
+    doi: str | None = None
 
 
 def _looks_like_author_line(line: str) -> bool:
@@ -134,20 +135,73 @@ def download_papers(
             )
             continue
 
-        best_match = max(
-            papers,
-            key=lambda paper: _fuzzy_ratio(title, paper.get("name", ""))
-        )
-        ratio = _fuzzy_ratio(title, best_match.get("name", ""))
+        ranked_candidates = []
+        for paper in papers:
+            paper_title = paper.get("name", "")
+            ranked_candidates.append(
+                (paper, _fuzzy_ratio(title, paper_title))
+            )
 
-        if ratio < min_ratio:
+        ranked_candidates.sort(key=lambda item: item[1], reverse=True)
+
+        matched_paper = None
+        matched_ratio = None
+        matched_doi = None
+        captcha_failure = False
+
+        for index, (paper, ratio) in enumerate(ranked_candidates):
+            if ratio < min_ratio:
+                break
+
+            identifier = paper.get("url", "")
+
+            try:
+                doi = None
+                if index == 0:
+                    doi, _ = scihub.search_for_doi(
+                        paper.get("name", ""), limit=search_limit
+                    )
+                if not doi:
+                    doi = scihub.resolve_identifier_to_doi(identifier)
+            except CaptchaNeedException as exc:
+                results.append(
+                    DownloadResult(
+                        title,
+                        paper.get("name"),
+                        ratio,
+                        None,
+                        str(exc),
+                    )
+                )
+                captcha_failure = True
+                break
+
+            if doi:
+                matched_paper = paper
+                matched_ratio = ratio
+                matched_doi = doi
+                break
+
+        if captcha_failure:
+            continue
+
+        if not matched_paper:
+            best_candidate = ranked_candidates[0][0] if ranked_candidates else {}
+            best_ratio = ranked_candidates[0][1] if ranked_candidates else None
+            error_message = "No viable search candidates"
+            if ranked_candidates:
+                if best_ratio is not None and best_ratio >= min_ratio:
+                    error_message = "Unable to resolve DOI from search results"
+                elif best_ratio is not None:
+                    error_message = f"Best match below threshold ({best_ratio:.2f} < {min_ratio})"
+
             results.append(
                 DownloadResult(
                     title,
-                    best_match.get("name"),
-                    ratio,
+                    best_candidate.get("name") if best_candidate else None,
+                    best_ratio,
                     None,
-                    f"Best match below threshold ({ratio:.2f} < {min_ratio})",
+                    error_message,
                 )
             )
             continue
@@ -155,25 +209,45 @@ def download_papers(
         filename = _sanitize_filename(title) + ".pdf"
         try:
             data = scihub.download(
-                best_match.get("url", ""),
+                matched_doi,
                 destination=output_dir,
                 path=filename,
             )
         except CaptchaNeedException as exc:
             results.append(
-                DownloadResult(title, best_match.get("name"), ratio, None, str(exc))
+                DownloadResult(
+                    title,
+                    matched_paper.get("name"),
+                    matched_ratio,
+                    None,
+                    str(exc),
+                    matched_doi,
+                )
             )
             continue
 
         if "err" in data:
             results.append(
-                DownloadResult(title, best_match.get("name"), ratio, None, data["err"])
+                DownloadResult(
+                    title,
+                    matched_paper.get("name"),
+                    matched_ratio,
+                    None,
+                    data["err"],
+                    matched_doi,
+                )
             )
             continue
 
         file_path = os.path.join(output_dir, filename)
         results.append(
-            DownloadResult(title, best_match.get("name"), ratio, file_path)
+            DownloadResult(
+                title,
+                matched_paper.get("name"),
+                matched_ratio,
+                file_path,
+                doi=matched_doi,
+            )
         )
 
     return results
